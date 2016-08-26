@@ -21,6 +21,55 @@ limitations under the License.
 
 #include "libjsonnet.h"
 
+#if PY_MAJOR_VERSION >= 3
+#define IS_PY3K
+#endif
+
+#ifdef IS_PY3K
+
+static const char *PyString_AsString(PyObject *o) {
+	if (PyUnicode_Check(o)) {
+		PyObject * temp_bytes = PyUnicode_AsUTF8String(o);
+		if (temp_bytes != NULL) {
+			char * result = strdup(PyBytes_AS_STRING(temp_bytes));
+			Py_DECREF(temp_bytes);
+			return result;
+		} 
+	} 
+	return NULL;
+}
+
+// in python3 we need an intermediate object to support PyString_AsString
+// conversion, so we strdup and then use this function to free the
+// value later
+static void free_PyString_AsString(const char *tmp) {
+	if (tmp) free((void*)tmp);
+}
+
+static PyObject *PyString_FromString(const char *str) {
+	return PyUnicode_FromString(str);
+}
+
+static int PyString_Check(PyObject *o) {
+	return PyUnicode_Check(o);
+}
+
+static int PyInt_Check(PyObject *o) {
+	return PyLong_Check(o);
+}
+
+static long PyInt_AsLong(PyObject *io) {
+	return PyLong_AsLong(io);
+}
+
+#else
+
+// in python2.7 we don't need to free values, so this is an
+// empty function.
+static void free_PyString_AsString(const char *tmp) { }
+
+#endif
+
 static char *jsonnet_str(struct JsonnetVm *vm, const char *str)
 {
     char *out = jsonnet_realloc(vm, NULL, strlen(str) + 1);
@@ -46,14 +95,24 @@ static struct JsonnetJsonValue *python_to_jsonnet_json(struct JsonnetVm *vm, PyO
                                                        const char **err_msg)
 {
     if (PyString_Check(v)) {
-        return jsonnet_json_make_string(vm, PyString_AsString(v));
+		const char *v_ = PyString_AsString(v);
+		struct JsonnetJsonValue *r = jsonnet_json_make_string(vm, v_);
+		free_PyString_AsString(v_);
+		return r;
+
     } else if (PyUnicode_Check(v)) {
-        struct JsonnetJsonValue *r;
-        PyObject *str = PyUnicode_AsUTF8String(v);
-        r = jsonnet_json_make_string(vm, PyString_AsString(str));
-        Py_DECREF(str);
-        return r;
-    } else if (PyBool_Check(v)) {
+	 	struct JsonnetJsonValue *r;
+		PyObject *str = PyUnicode_AsUTF8String(v);
+#ifdef IS_PY3K
+		const char *str_ = PyBytes_AsString(str);
+#else
+		const char *str_ = PyString_AsString(str);
+#endif
+		r = jsonnet_json_make_string(vm, str_);
+		Py_DECREF(str);
+		return r;
+
+	} else if (PyBool_Check(v)) {
         return jsonnet_json_make_bool(vm, PyObject_IsTrue(v));
     } else if (PyFloat_Check(v)) {
         return jsonnet_json_make_number(vm, PyFloat_AsDouble(v));
@@ -100,6 +159,8 @@ static struct JsonnetJsonValue *python_to_jsonnet_json(struct JsonnetVm *vm, PyO
                 return NULL;
             }
             jsonnet_json_object_append(vm, obj, key_, json_val);
+			free_PyString_AsString(key_);
+
         }
         return obj;
     } else {
@@ -153,9 +214,11 @@ static struct JsonnetJsonValue *cpython_native_callback(
 
     if (result == NULL) {
         // Get string from exception.
-        struct JsonnetJsonValue *r = jsonnet_json_make_string(ctx->vm, exc_to_str());
+		const char *exc_str = exc_to_str();
+        struct JsonnetJsonValue *r = jsonnet_json_make_string(ctx->vm, exc_str);
         *succ = 0;
         PyErr_Clear();
+		free_PyString_AsString(exc_str);
         return r;
     }
 
@@ -213,6 +276,8 @@ static char *cpython_import_callback(void *ctx_, const char *base, const char *r
             *found_here = jsonnet_str(ctx->vm, found_here_cstr);
             out = jsonnet_str(ctx->vm, content_cstr);
             *success = 1;
+			free_PyString_AsString(found_here_cstr);
+			free_PyString_AsString(content_cstr);
         }
     }
 
@@ -247,11 +312,13 @@ int handle_vars(struct JsonnetVm *vm, PyObject *map, int code, int tla)
         const char *key_ = PyString_AsString(key);
         if (key_ == NULL) {
             jsonnet_destroy(vm);
+			free_PyString_AsString(key_);
             return 0;
         }
         const char *val_ = PyString_AsString(val);
         if (val_ == NULL) {
             jsonnet_destroy(vm);
+			free_PyString_AsString(val_);
             return 0;
         }
         if (!tla && !code) {
@@ -263,6 +330,8 @@ int handle_vars(struct JsonnetVm *vm, PyObject *map, int code, int tla)
         } else {
             jsonnet_tla_code(vm, key_, val_);
         }
+		free_PyString_AsString(key_);
+		free_PyString_AsString(val_);
     }
     return 1;
 }
@@ -340,10 +409,12 @@ static int handle_native_callbacks(struct JsonnetVm *vm, PyObject *native_callba
         }
 
         num_natives++;
+		free_PyString_AsString(key_);
         continue;
 
         bad:
         jsonnet_destroy(vm);
+		free_PyString_AsString(key_);
         return 0;
     }
 
@@ -374,8 +445,12 @@ static int handle_native_callbacks(struct JsonnetVm *vm, PyObject *native_callba
         (*ctxs)[num_natives].argc = num_params;
         jsonnet_native_callback(vm, key_, cpython_native_callback, &(*ctxs)[num_natives],
                                 params_c);
+		for (i=0; i < num_params; ++i) {
+			free_PyString_AsString(params_c[i]);
+		}
         free(params_c);
         num_natives++;
+		free_PyString_AsString(key_);
     }
 
     return 1;
@@ -490,6 +565,10 @@ static PyObject* evaluate_snippet(PyObject* self, PyObject* args, PyObject *keyw
     return handle_result(vm, out, error);
 }
 
+struct module_state {
+	PyObject *error;
+};
+
 static PyMethodDef module_methods[] = {
     {"evaluate_file", (PyCFunction)evaluate_file, METH_VARARGS | METH_KEYWORDS,
      "Interpret the given Jsonnet file."},
@@ -498,8 +577,31 @@ static PyMethodDef module_methods[] = {
     {NULL, NULL, 0, NULL}
 };
 
-PyMODINIT_FUNC init_jsonnet(void)
-{
-    Py_InitModule3("_jsonnet", module_methods, "A Python interface to Jsonnet.");
-}
+#define MODULE_NAME "_jsonnet"
+#define MODULE_DOC "A Python interface to Jsonnet."
 
+#ifdef IS_PY3K
+static struct PyModuleDef moduledef = {
+	PyModuleDef_HEAD_INIT,
+	MODULE_NAME,
+	MODULE_DOC,
+	0, // no module state
+	module_methods,
+	NULL, // no slots
+	NULL, // no module state, so no traverse needed
+	NULL, // no module state, so no clear function needed
+	NULL  // no module state, no free function needed
+};
+#endif
+
+#ifdef IS_PY3K
+PyMODINIT_FUNC PyInit__jsonnet(void) 
+{
+    return PyModule_Create(&moduledef);
+}
+#else
+PyMODINIT_FUNC init_jsonnet(void) 
+{
+    Py_InitModule3(MODULE_NAME, module_methods, MODULE_DOC);
+}
+#endif
